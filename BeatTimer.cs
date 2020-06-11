@@ -9,13 +9,14 @@ namespace BeatTimer
 {
     public struct Beat
     {
-        public Beat(double time, int section, int beat, double intensity, double prominence)
+        public Beat(double time, int section, int beat, double intensity, double prominence, int index)
         {
             T = time;
             I = intensity;
             P = prominence;
             S = section;
             B = beat;
+            D = index;
         }
 
         public double T { get; }
@@ -23,6 +24,7 @@ namespace BeatTimer
         public double P { get; }
         public int S { get; }
         public int B { get; }
+        public int D { get; }
 
         public override string ToString()
         {
@@ -36,10 +38,11 @@ namespace BeatTimer
         public static Beat[] beatdata(String wavfilename)
         {
             WavReader.readWav(wavfilename, out double[] data, out double samplerate);
-            return beatdata(data, samplerate);
+            int offset;
+            return beatdata(data, samplerate, out offset);
         }
 #endif
-        public static Beat[] beatdata(double[] data, double samplerate)
+        public static Beat[] beatdata(double[] data, double samplerate, out int wholeBeatOffset)
         {
             int step = 128;
             int size = 2048;
@@ -48,7 +51,7 @@ namespace BeatTimer
             var rolling = rollingsum(spec, 5);
             var del = bpmtodel(bpm, samplerate, step);
             var indexes = beatindexes(rolling, del / 8);
-            return beatdata(spec, indexes, samplerate, step, bpm);
+            return beatdata(spec, indexes, samplerate, step, bpm, out wholeBeatOffset);
         }
 
         /// <summary>
@@ -58,9 +61,13 @@ namespace BeatTimer
         /// <param name="indexes">Beat start indexes</param>
         /// <param name="samplerate">48000.0hz, 44100.0hz, etc</param>
         /// <param name="step">FFT increment</param>
+        /// <param name="wholeBeatOffset">The 0-based offset indicating which of the 8 1/8th beats is the whole beat.</param>
         /// <returns>Beat data array</returns>
-        public static Beat[] beatdata(double[] spec, int[] indexes, double samplerate, int step, double bpm)
+        public static Beat[] beatdata(double[] spec, int[] indexes, double samplerate, int step, double bpm, out int wholeBeatOffset)
         {
+            double[] intensityBuckets = new double[8];
+            Queue<double> deltas = new Queue<double>();
+
             int len = spec.Length;
             var beats = new List<Beat>();
             int previndex = 0;
@@ -69,7 +76,8 @@ namespace BeatTimer
             int section = 0;
             int beat = 0;
             double prevBeatTime = 0;
-            double prevBeatDelta = 0;
+            double totalBeatDeltas = 0;
+            double avgBeatDelta = 0;
             bool newSection = false;
 
             foreach (int index in indexes)
@@ -81,7 +89,7 @@ namespace BeatTimer
 
                 double indextime = indextotime(index, samplerate, step);
                 double time = starttime + 60 * beat / (bpm * 8);
-                if (Math.Abs(time - indextime) > 0.01)
+                if (Math.Abs(time - indextime) > 0.0025)
                 {
                     newSection = true;
                     beat = 0;
@@ -89,8 +97,13 @@ namespace BeatTimer
                     time = indextime;
                 }
 
+                double timeDiff = time - prevBeatTime;
+
+                if (deltas.Count > 0)
+                    avgBeatDelta = totalBeatDeltas / deltas.Count;
+
                 // Only add the beat if the time delta is more than half of our previously established delta:
-                if (time - prevBeatTime > prevBeatDelta * 0.5f)
+                if (timeDiff > avgBeatDelta * 0.5f || avgBeatDelta == 0)
                 {
                     if (newSection)
                     {
@@ -103,15 +116,46 @@ namespace BeatTimer
                     // Prominence is ratio between max in short range to min of long preceeding range
                     double prominence = selection.Max() / (spec.RangeSelect(previndex, index).Min() + 1);
 
-                    beats.Add(new Beat(time, section, beat, intensity, prominence));
+                    // If the time delta is more than 1.5 times the previously established delta, add an extra beat to maintain
+                    // continuity of our beat offsetS:
+                    if (timeDiff > avgBeatDelta * 1.5f && avgBeatDelta > 0)
+                    {
+                        beats.Add(new Beat(prevBeatTime + timeDiff * 0.5f, section, beat, 0, 0, beats.Count));
+                        ++beat;
+                        intensityBuckets[beats.Count % 8] += intensity;
+                    }
+
+                    beats.Add(new Beat(time, section, beat, intensity, prominence, beats.Count));
                     beat++;
 
-                    prevBeatDelta = time - prevBeatTime;
+                    intensityBuckets[beats.Count % 8] += intensity;
+
+                    deltas.Enqueue(timeDiff);
+                    totalBeatDeltas += timeDiff;
+
+                    if (deltas.Count > 8)
+                        totalBeatDeltas -= deltas.Dequeue();
+
+                    avgBeatDelta = totalBeatDeltas / deltas.Count;
+
                     prevBeatTime = time;
                 }
 
                 previndex = index;
             }
+
+            double maxIntensity = 0;
+            wholeBeatOffset = 0;
+
+            for (int i = 0; i < intensityBuckets.Length; ++i)
+            {
+                if (maxIntensity < intensityBuckets[i])
+                {
+                    maxIntensity = intensityBuckets[i];
+                    wholeBeatOffset = i;
+                }
+            }
+
             return beats.ToArray();
         }
 
