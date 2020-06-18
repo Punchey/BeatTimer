@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Xml.Schema;
 using FFTWSharp;
 using Kinemotik;
 
@@ -9,14 +10,13 @@ namespace BeatTimer
 {
     public struct Beat
     {
-        public Beat(double time, int section, int beat, double intensity, double prominence, int index)
+        public Beat(double time, int section, int beat, double intensity, double prominence)
         {
             T = time;
             I = intensity;
             P = prominence;
             S = section;
             B = beat;
-            D = index;
         }
 
         public double T { get; }
@@ -24,7 +24,6 @@ namespace BeatTimer
         public double P { get; }
         public int S { get; }
         public int B { get; }
-        public int D { get; }
 
         public override string ToString()
         {
@@ -34,24 +33,31 @@ namespace BeatTimer
 
     class BeatTimer
     {
+        public static float Progress { get { return (SpectrogramProgress * 0.876f) + (BPMProgress * 0.134f); } }
+
+        public static float SpectrogramProgress { get; private set; }
+        public static float BPMProgress { get; private set; }
+
 #if !UNITY_5_3_OR_NEWER
-        public static Beat[] beatdata(String wavfilename)
+        public static List<Beat> beatdata(String wavfilename)
         {
             WavReader.readWav(wavfilename, out double[] data, out double samplerate);
-            int offset;
-            return beatdata(data, samplerate, out offset);
+            return beatdata(data, samplerate);
         }
 #endif
-        public static Beat[] beatdata(double[] data, double samplerate, out int wholeBeatOffset)
+        public static List<Beat> beatdata(double[] data, double samplerate, double bpmFloor, double bpmCeiling)
         {
+            SpectrogramProgress = 0;
+            BPMProgress = 0;
+
             int step = 128;
             int size = 2048;
             var spec = spectrogram(data, size, step);
-            var bpm = getbpm(spec, samplerate, step);
+            var bpm = getbpm(spec, samplerate, step, bpmFloor, bpmCeiling);
             var rolling = rollingsum(spec, 5);
             var del = bpmtodel(bpm, samplerate, step);
             var indexes = beatindexes(rolling, del / 8);
-            return beatdata(spec, indexes, samplerate, step, bpm, out wholeBeatOffset);
+            return beatdata(spec, indexes, samplerate, step, bpm);
         }
 
         /// <summary>
@@ -61,13 +67,10 @@ namespace BeatTimer
         /// <param name="indexes">Beat start indexes</param>
         /// <param name="samplerate">48000.0hz, 44100.0hz, etc</param>
         /// <param name="step">FFT increment</param>
-        /// <param name="wholeBeatOffset">The 0-based offset indicating which of the 8 1/8th beats is the whole beat.</param>
         /// <returns>Beat data array</returns>
-        public static Beat[] beatdata(double[] spec, int[] indexes, double samplerate, int step, double bpm, out int wholeBeatOffset)
+        public static List<Beat> beatdata(double[] spec, int[] indexes, double samplerate, int step, double bpm)
         {
             double[] intensityBuckets = new double[8];
-            Queue<double> deltas = new Queue<double>();
-
             int len = spec.Length;
             var beats = new List<Beat>();
             int previndex = 0;
@@ -76,8 +79,7 @@ namespace BeatTimer
             int section = 0;
             int beat = 0;
             double prevBeatTime = 0;
-            double totalBeatDeltas = 0;
-            double avgBeatDelta = 0;
+            double prevBeatDelta = 0;
             bool newSection = false;
 
             foreach (int index in indexes)
@@ -89,7 +91,7 @@ namespace BeatTimer
 
                 double indextime = indextotime(index, samplerate, step);
                 double time = starttime + 60 * beat / (bpm * 8);
-                if (Math.Abs(time - indextime) > 0.0025)
+                if (Math.Abs(time - indextime) > 0.005)
                 {
                     newSection = true;
                     beat = 0;
@@ -97,13 +99,8 @@ namespace BeatTimer
                     time = indextime;
                 }
 
-                double timeDiff = time - prevBeatTime;
-
-                if (deltas.Count > 0)
-                    avgBeatDelta = totalBeatDeltas / deltas.Count;
-
                 // Only add the beat if the time delta is more than half of our previously established delta:
-                if (timeDiff > avgBeatDelta * 0.5f || avgBeatDelta == 0)
+                if (time - prevBeatTime > prevBeatDelta * 0.5f)
                 {
                     if (newSection)
                     {
@@ -116,47 +113,33 @@ namespace BeatTimer
                     // Prominence is ratio between max in short range to min of long preceeding range
                     double prominence = selection.Max() / (spec.RangeSelect(previndex, index).Min() + 1);
 
-                    // If the time delta is more than 1.5 times the previously established delta, add an extra beat to maintain
-                    // continuity of our beat offsetS:
-                    if (timeDiff > avgBeatDelta * 1.5f && avgBeatDelta > 0)
-                    {
-                        beats.Add(new Beat(prevBeatTime + timeDiff * 0.5f, section, beat, 0, 0, beats.Count));
-                        ++beat;
-                        intensityBuckets[beats.Count % 8] += intensity;
-                    }
-
-                    beats.Add(new Beat(time, section, beat, intensity, prominence, beats.Count));
+                    beats.Add(new Beat(time, section, beat, intensity, prominence));
                     beat++;
 
-                    intensityBuckets[beats.Count % 8] += intensity;
-
-                    deltas.Enqueue(timeDiff);
-                    totalBeatDeltas += timeDiff;
-
-                    if (deltas.Count > 8)
-                        totalBeatDeltas -= deltas.Dequeue();
-
-                    avgBeatDelta = totalBeatDeltas / deltas.Count;
-
+                    prevBeatDelta = time - prevBeatTime;
                     prevBeatTime = time;
+
+                    intensityBuckets[beats.Count % 8] += intensity;
                 }
 
                 previndex = index;
             }
 
+            // Find first instance of whole beat and chop off preceeding notes so that first beat is whole beat
             double maxIntensity = 0;
-            wholeBeatOffset = 0;
+            int wholeBeatIndex = 0;
 
             for (int i = 0; i < intensityBuckets.Length; ++i)
             {
                 if (maxIntensity < intensityBuckets[i])
                 {
                     maxIntensity = intensityBuckets[i];
-                    wholeBeatOffset = i;
+                    wholeBeatIndex = i;
                 }
             }
 
-            return beats.ToArray();
+            beats.RemoveRange(0, wholeBeatIndex);
+            return beats;
         }
 
         /// <summary>
@@ -168,15 +151,16 @@ namespace BeatTimer
         public static int[] beatindexes(double[] spec, double del)
         {
             var indexes = new List<int>();
-            // Readjust the starting point every 2000 samples (roughly every 5 seconds)
+            // Readjust the starting point every <group> samples (roughly every 5 seconds)
             // This is to counteract tempo drift due to changing bpm's or other factors
-            for (int x = 0; x + 2000 < spec.Length; x += 2000)
+            for (int x = 0; x + 5000 < spec.Length; x += 1000)
             {
-                int upper = x + 4000 > spec.Length ? spec.Length : x + 2000;
+                int upper = x + 5000 > spec.Length ? spec.Length : x + 5000;
+                int limit = upper == spec.Length ? upper : x + 1000;
                 int firstindex = firstbeatindex(spec.RangeSelect(x, upper - 1), del) + x;
                 int index = firstindex;
                 int i = 0;
-                while (index < upper)
+                while (index < limit)
                 {
                     indexes.Add(index);
                     i++;
@@ -275,8 +259,10 @@ namespace BeatTimer
         /// <param name="spec">Flux array: get using spectrogram method</param>
         /// <param name="samplerate">48000.0hz, 44100.0hz, etc</param>
         /// <param name="step">FFT increment</param>
+        /// <param name="bpmFloor">The lowest desired bpm, below which the BPM will be doubled</param>
+        /// <param name="bpmCeiling">The highest desired bpm, above which the BPM will be halved</param>
         /// <returns>Estimated bpm</returns>
-        public static double getbpm(double[] spec, double samplerate, int step)
+        public static double getbpm(double[] spec, double samplerate, int step, double bpmFloor, double bpmCeiling)
         {
             int lower = (int)Math.Floor(bpmtodel(75, samplerate, step)) - 1;
             int upper = (int)Math.Ceiling(bpmtodel(15, samplerate, step)) + 1;
@@ -288,6 +274,8 @@ namespace BeatTimer
             for (int i = lower; i <= upper; i++)
             {
                 bins[i - lower] = comb(spec, i);
+
+                BPMProgress = (i / (float)upper) * 0.5f;
             }
 
             for (int i = 1; i < upper - lower; i++)
@@ -297,6 +285,8 @@ namespace BeatTimer
                     minindex = i;
                     freqmin = bins[i];
                 }
+
+                BPMProgress = (i / (float)(upper - lower)) * 0.5f + 0.5f;
             }
 
             double selectedbpm = bpmtodel(lower + minindex, samplerate, step);
@@ -354,6 +344,8 @@ namespace BeatTimer
                         spec[index - 10] += diff > 0 ? diff : 0;
                     }
                 }
+
+                SpectrogramProgress = (i + size + step) / (float)n;
             }
             fftw.destroy_plan(plan);
             fftw.free(ptr);
