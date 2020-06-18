@@ -291,7 +291,23 @@ namespace BeatTimer
 
             double selectedbpm = bpmtodel(lower + minindex, samplerate, step);
             double bpm = selectedbpm * 8;
-            return bpm > 400 ? Math.Round(bpm / 2) / 2 : Math.Round(bpm) / 2;
+
+            if (bpm < bpmFloor)
+            {
+                while (bpm < bpmFloor)
+                    bpm *= 2d;
+
+                bpm = Math.Round(bpm);
+            }
+            else if (bpm > bpmCeiling)
+            {
+                bpm = Math.Round(bpm);
+
+                while (bpm > bpmCeiling)
+                    bpm /= 2d;
+            }
+
+            return bpm;
         }
 
 
